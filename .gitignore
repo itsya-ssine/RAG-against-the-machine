@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Type checking / linting / testing caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# uv
+.python-version
+
+# Data & model artifacts (regenerated at evaluation time, not committed)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/output/**/*
+!data/output/**/.gitkeep
+
+# Model weights / caches
+*.pt
+*.bin
+*.safetensors
+.cache/
+models/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
