@@ -11,6 +11,7 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "transformers>=4.44.0",
     "torch>=2.3.0",
+    "types-tqdm>=4.70.0.20260906",
 ]
 
 [dependency-groups]
