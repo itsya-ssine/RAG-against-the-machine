@@ -1,16 +1,24 @@
-"""Shared building blocks used by both chunking strategies.
+"""Shared building blocks used by every chunking strategy.
 
-Both the Python code chunker and the Markdown/text chunker face the same
-underlying problem: given a source file and a list of offsets marking the
-end of each semantic unit (a top-level statement, a paragraph, a
-section...), group consecutive units into chunks that stay under
-`max_chunk_size`, and fall back to a fixed-size split for any single unit
-that alone is already too wide. This module implements that once so the
-two chunkers only need to compute their own notion of "unit".
+All chunkers (Python AST, Markdown/text, C-family/JS/CSS, generic text)
+face the same underlying problem: given a source file and a list of
+offsets marking the end of each semantic unit (a top-level statement, a
+paragraph, a section, a function...), group consecutive units into
+chunks that stay under `max_chunk_size`, and fall back to a finer split
+for any single unit that alone is already too wide. This module
+implements that once so each chunker only needs to compute its own
+notion of "unit".
+
+The fallback ladder used across the package is, from coarse to fine:
+semantic units -> paragraphs -> lines -> fixed-size windows.
 """
 
+import re
 from dataclasses import dataclass
 from typing import Callable
+
+_LINE_END_RE = re.compile(r"\r\n|\r|\n")
+_PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t\r]*\n")
 
 
 @dataclass
@@ -41,6 +49,55 @@ class RawChunk:
 OversizedHandler = Callable[[str, str, int, int, int], "list[RawChunk]"]
 
 
+def line_start_offsets(source: str) -> "list[int]":
+    """Compute the character offset at which each line starts.
+
+    Only ``\\n``, ``\\r\\n`` and ``\\r`` are line terminators. Unlike
+    ``str.splitlines`` this ignores form feeds, ``\\x85``, ``\\u2028``
+    and friends, so the numbering agrees with what ``ast`` reports.
+
+    Args:
+        source: The full file content.
+
+    Returns:
+        A list where index i holds the offset of the start of line
+        i + 1, with a final entry equal to len(source). An empty
+        source yields ``[0]``.
+    """
+    offsets = [0]
+    for match in _LINE_END_RE.finditer(source):
+        offsets.append(match.end())
+    if offsets[-1] != len(source):
+        offsets.append(len(source))
+    return offsets
+
+
+def paragraph_ends(source: str, first: int, last: int) -> "list[int]":
+    """Return the end offsets of blank-line separated paragraphs.
+
+    A paragraph includes the blank line(s) that follow it, so that the
+    separator stays attached to the paragraph it terminates.
+
+    Args:
+        source: Full file content.
+        first: Start offset of the region.
+        last: End offset (exclusive) of the region.
+
+    Returns:
+        Strictly increasing offsets in (first, last], always ending
+        with ``last``. Empty if the region is empty.
+    """
+    if first >= last:
+        return []
+    ends = [
+        match.end()
+        for match in _PARAGRAPH_BREAK_RE.finditer(source, first, last)
+        if match.end() < last
+    ]
+    ends.append(last)
+    return ends
+
+
 def split_fixed_size(
     file_path: str,
     source: str,
@@ -50,9 +107,8 @@ def split_fixed_size(
 ) -> "list[RawChunk]":
     """Split a span into fixed-size windows of at most max_chunk_size.
 
-    Last-resort fallback used when a single semantic unit (a very long
-    function, a section with no paragraph breaks, ...) is wider than
-    max_chunk_size on its own.
+    Last-resort fallback used when nothing finer can be found (for
+    instance a single line wider than max_chunk_size).
 
     Args:
         file_path: Path of the source file, as stored in the corpus.
@@ -91,14 +147,16 @@ def chunk_by_boundaries(
 ) -> "list[RawChunk]":
     """Greedily group semantic units into chunks under max_chunk_size.
 
-    `boundaries` must be sorted, strictly increasing, and end with the
-    offset marking the end of the region being chunked (typically
-    len(source) or the end of a section). Starting from `start`, this
-    function extends a running group as far as the boundaries allow
-    while staying within max_chunk_size, then flushes it as one chunk.
-    If a single unit (from the current cursor to the next boundary)
-    already overflows max_chunk_size on its own, `oversized_handler` is
-    used to split it further instead.
+    `boundaries` must be sorted and end with the offset marking the end
+    of the region being chunked (typically len(source) or the end of a
+    section). Boundaries that do not move past the running cursor
+    (duplicates, for instance) are ignored, so no empty chunk is ever
+    produced. Starting from `start`, this function extends a running
+    group as far as the boundaries allow while staying within
+    max_chunk_size, then flushes it as one chunk. If a single unit
+    (from the current cursor to the next boundary) already overflows
+    max_chunk_size on its own, `oversized_handler` is used to split it
+    further instead.
 
     Args:
         file_path: Path of the source file, as stored in the corpus.
@@ -131,6 +189,11 @@ def chunk_by_boundaries(
             reach += 1
         end = boundaries[reach]
 
+        if end <= cursor:
+            # Duplicate / already-consumed boundary: nothing to emit.
+            index = reach + 1
+            continue
+
         if end - cursor <= max_chunk_size:
             chunks.append(
                 RawChunk(
@@ -155,3 +218,43 @@ def chunk_by_boundaries(
         index = reach + 1
 
     return chunks
+
+
+def split_by_lines(
+    file_path: str,
+    source: str,
+    first: int,
+    last: int,
+    max_chunk_size: int,
+) -> "list[RawChunk]":
+    """Split a span on line boundaries, packing lines up to the limit.
+
+    Preferred over `split_fixed_size` as the last resort for text: it
+    keeps table rows, statements and config entries whole. Only a
+    single line wider than max_chunk_size is cut mid-line.
+
+    Args:
+        file_path: Path of the source file, as stored in the corpus.
+        source: Full content of the file.
+        first: Start offset of the span to split.
+        last: End offset (exclusive) of the span to split.
+        max_chunk_size: Maximum number of characters per chunk.
+
+    Returns:
+        A list of RawChunk covering exactly [first, last), each at most
+        max_chunk_size characters wide.
+    """
+    if first >= last:
+        return []
+    ends = [
+        first + offset
+        for offset in line_start_offsets(source[first:last])[1:]
+    ]
+    return chunk_by_boundaries(
+        file_path,
+        source,
+        first,
+        ends,
+        max_chunk_size,
+        oversized_handler=split_fixed_size,
+    )

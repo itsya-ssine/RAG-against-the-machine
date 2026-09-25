@@ -2,30 +2,26 @@
 
 Splits a Python file into chunks aligned on top-level statement
 boundaries (imports, functions, classes, ...) rather than arbitrary
-character windows, so a chunk never cuts a function in half unless that
-single function alone is already wider than max_chunk_size.
+character windows. A top-level statement wider than max_chunk_size (a
+big class, typically) is split recursively along its own body, so a
+chunk only cuts through a method when that method's individual
+statements are still too wide.
 """
 
 import ast
+import warnings
+from typing import Callable
 
-from src.chunking.common import RawChunk, chunk_by_boundaries, split_fixed_size
+from src.chunking.common import (
+    RawChunk,
+    chunk_by_boundaries,
+    line_start_offsets,
+    split_by_lines,
+)
+from src.chunking.generic_chunker import chunk_generic_file
 
-
-def _line_start_offsets(source: str) -> "list[int]":
-    """Compute the character offset at which each line starts.
-
-    Args:
-        source: The full file content.
-
-    Returns:
-        A list where index i holds the character offset of line i + 1
-        (AST line numbers are 1-indexed), with a final entry equal to
-        len(source).
-    """
-    offsets = [0]
-    for line in source.splitlines(keepends=True):
-        offsets.append(offsets[-1] + len(line))
-    return offsets
+_CHILD_FIELDS = ("body", "handlers", "orelse", "finalbody")
+_Handler = Callable[[str, str, int, int, int], "list[RawChunk]"]
 
 
 def _node_end_offset(
@@ -33,7 +29,7 @@ def _node_end_offset(
     line_offsets: "list[int]",
     source_len: int
 ) -> int:
-    """Return the character offset just past a top-level node's last line.
+    """Return the character offset just past a node's last line.
 
     Using only the *end* of each node (rather than its start) means
     everything between two statements - decorators, comments, blank
@@ -41,7 +37,7 @@ def _node_end_offset(
     without needing special-case handling.
 
     Args:
-        node: A top-level AST node.
+        node: An AST node with line information.
         line_offsets: Precomputed line-start offsets for the source.
         source_len: Total length of the source, used as a safe bound.
 
@@ -54,17 +50,101 @@ def _node_end_offset(
     return min(line_offsets[end_line], source_len)
 
 
+def _child_nodes(node: ast.AST) -> "list[ast.AST]":
+    """Return the statement-level children of a compound node.
+
+    Covers class/function bodies as well as if/try/with/for/while
+    blocks (body, except handlers, else and finally branches).
+
+    Args:
+        node: Any AST node.
+
+    Returns:
+        Child nodes carrying line information, or an empty list if the
+        node has no nested statements.
+    """
+    children: "list[ast.AST]" = []
+    for field in _CHILD_FIELDS:
+        value = getattr(node, field, None)
+        if isinstance(value, list):
+            children.extend(
+                child
+                for child in value
+                if isinstance(child, ast.AST)
+                and hasattr(child, "end_lineno")
+            )
+    return children
+
+
+def _make_descender(
+    line_offsets: "list[int]",
+    source_len: int,
+    node_by_end: "dict[int, ast.AST]",
+) -> _Handler:
+    """Build an oversized-unit handler that descends into node bodies.
+
+    Args:
+        line_offsets: Precomputed line-start offsets for the source.
+        source_len: Total length of the source.
+        node_by_end: Maps the end offset of each unit being split to
+            the AST node that produced it.
+
+    Returns:
+        A handler suitable for ``chunk_by_boundaries``. Units whose
+        node has no nested statements are split on line boundaries.
+    """
+
+    def handler(
+        file_path: str,
+        source: str,
+        first: int,
+        last: int,
+        max_chunk_size: int,
+    ) -> "list[RawChunk]":
+        node = node_by_end.get(last)
+        children = _child_nodes(node) if node is not None else []
+        if not children:
+            return split_by_lines(
+                file_path, source, first, last, max_chunk_size
+            )
+
+        pairs = sorted(
+            (
+                (_node_end_offset(child, line_offsets, source_len), child)
+                for child in children
+            ),
+            key=lambda pair: pair[0],
+        )
+        # The last child owns everything up to the end of the unit.
+        pairs[-1] = (last, pairs[-1][1])
+        child_by_end = dict(pairs)
+        ends = sorted(end for end in child_by_end if first < end <= last)
+        return chunk_by_boundaries(
+            file_path,
+            source,
+            first,
+            ends,
+            max_chunk_size,
+            oversized_handler=_make_descender(
+                line_offsets, source_len, child_by_end
+            ),
+        )
+
+    return handler
+
+
 def chunk_python_file(
     file_path: str,
     source: str,
     max_chunk_size: int = 2000,
 ) -> "list[RawChunk]":
-    """Chunk a Python source file at top-level statement boundaries.
+    """Chunk a Python source file at statement boundaries.
 
     Consecutive top-level statements are grouped together while the
     running chunk stays under max_chunk_size. A single statement wider
-    than max_chunk_size on its own (a very long function, for instance)
-    is split further into fixed-size windows.
+    than max_chunk_size on its own is split along its body (methods of
+    a class, statements of a function), recursively, and only then on
+    line boundaries.
 
     Args:
         file_path: Path of the source file, as stored in the corpus
@@ -85,29 +165,23 @@ def chunk_python_file(
     source_len = len(source)
 
     try:
-        tree = ast.parse(source)
-    except SyntaxError:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # A leading BOM makes ast.parse fail; it does not change
+            # any line number, so parsing without it keeps offsets valid.
+            tree = ast.parse(
+                source[1:] if source.startswith("\ufeff") else source
+            )
+    except (SyntaxError, ValueError, RecursionError):
         # Not parseable as Python (templated file, stray snippet, ...):
-        # fall back to plain fixed-size windows over the raw text.
-        return split_fixed_size(
-            file_path,
-            source,
-            0,
-            source_len,
-            max_chunk_size
-        )
+        # fall back to paragraph/line based chunking of the raw text.
+        return chunk_generic_file(file_path, source, max_chunk_size)
 
     top_level_nodes = list(ast.iter_child_nodes(tree))
     if not top_level_nodes:
-        return split_fixed_size(
-            file_path,
-            source,
-            0,
-            source_len,
-            max_chunk_size
-        )
+        return chunk_generic_file(file_path, source, max_chunk_size)
 
-    line_offsets = _line_start_offsets(source)
+    line_offsets = line_start_offsets(source)
     boundaries = [
         _node_end_offset(node, line_offsets, source_len)
         for node in top_level_nodes
@@ -116,10 +190,14 @@ def chunk_python_file(
     # comments/blank lines after the final statement are not dropped.
     boundaries[-1] = source_len
 
+    node_by_end = dict(zip(boundaries, top_level_nodes))
     return chunk_by_boundaries(
         file_path,
         source,
         0,
         boundaries,
-        max_chunk_size
+        max_chunk_size,
+        oversized_handler=_make_descender(
+            line_offsets, source_len, node_by_end
+        ),
     )

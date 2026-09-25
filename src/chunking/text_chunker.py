@@ -1,26 +1,36 @@
-"""Markdown / plain-text chunker.
+"""Markdown chunker.
 
-Splits a Markdown file along its header structure so each chunk stays a
-coherent section, then further splits any section wider than
-max_chunk_size along paragraph (blank-line) breaks. Files with no
-headers at all (plain .txt) are treated as a single section, so the
-same paragraph-splitting fallback applies to them too.
+Splits a Markdown (or reStructuredText) file along its header structure
+so each chunk stays a coherent section, then further splits any section
+wider than max_chunk_size along paragraph (blank-line) breaks, then
+along lines (so table rows stay whole), and only as a last resort into
+fixed-size windows.
+
+Lines starting with ``#`` inside fenced code blocks (shell comments,
+Python comments...) are not headers and never start a section.
+Files with no headers at all are treated as a single section.
 """
 
 import re
 
-from src.chunking.common import RawChunk, chunk_by_boundaries, split_fixed_size
+from src.chunking.common import (
+    RawChunk,
+    chunk_by_boundaries,
+    line_start_offsets,
+    paragraph_ends,
+    split_by_lines,
+)
 
-_HEADER_RE = re.compile(r"^#{1,6}[ \t]+\S", re.MULTILINE)
-_PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n")
+_HEADER_RE = re.compile(r"#{1,6}[ \t]+\S")
+_FENCE_RE = re.compile(r"[ \t]{0,3}(`{3,}|~{3,})")
 
 
 def _section_start_offsets(source: str) -> "list[int]":
     """Return the offsets where each Markdown section begins.
 
-    A section starts at a header line (`#` through `######`). If the
-    file has no headers, the whole file is treated as one section
-    starting at offset 0.
+    A section starts at a header line (`#` through `######`) that is
+    not inside a fenced code block. The file start is always a section
+    start, so a file with no headers is a single section.
 
     Args:
         source: Full file content.
@@ -29,8 +39,22 @@ def _section_start_offsets(source: str) -> "list[int]":
         Sorted, deduplicated list of section start offsets, always
         including 0.
     """
-    starts = {match.start() for match in _HEADER_RE.finditer(source)}
-    starts.add(0)
+    offsets = line_start_offsets(source)
+    starts = {0}
+    fence = ""
+    for index in range(len(offsets) - 1):
+        line = source[offsets[index]:offsets[index + 1]]
+        fence_match = _FENCE_RE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not fence:
+                fence = marker
+            elif (marker[0] == fence[0]
+                    and len(marker) >= len(fence)
+                    and set(line.strip()) == {marker[0]}):
+                fence = ""
+        elif not fence and _HEADER_RE.match(line):
+            starts.add(offsets[index])
     return sorted(starts)
 
 
@@ -46,7 +70,8 @@ def _split_section_by_paragraphs(
     Used as the oversized-unit handler when a whole section is wider
     than max_chunk_size: grouping paragraphs preserves more structure
     than an immediate fixed-size cut. Any single paragraph that is
-    itself still too wide falls through to a fixed-size split.
+    itself still too wide (a big table, for example) is split on line
+    boundaries.
 
     Args:
         file_path: Path of the source file, as stored in the corpus.
@@ -58,20 +83,13 @@ def _split_section_by_paragraphs(
     Returns:
         A list of RawChunk covering [first, last).
     """
-    section = source[first:last]
-    paragraph_ends = [
-        first + match.end()
-        for match in _PARAGRAPH_BREAK_RE.finditer(section)
-    ]
-    paragraph_ends.append(last)
-
     return chunk_by_boundaries(
         file_path,
         source,
         first,
-        paragraph_ends,
+        paragraph_ends(source, first, last),
         max_chunk_size,
-        oversized_handler=split_fixed_size,
+        oversized_handler=split_by_lines,
     )
 
 
@@ -80,18 +98,17 @@ def chunk_text_file(
     source: str,
     max_chunk_size: int = 2000,
 ) -> "list[RawChunk]":
-    """Chunk a Markdown or plain-text file along its section structure.
+    """Chunk a Markdown file along its section structure.
 
     Consecutive sections are grouped together while the running chunk
     stays under max_chunk_size. A single section wider than
     max_chunk_size on its own is split further along paragraph breaks,
-    and a single paragraph wider still falls back to a fixed-size
-    split.
+    then line breaks, then fixed-size windows.
 
     Args:
         file_path: Path of the source file, as stored in the corpus
             (used verbatim in the resulting chunk offsets).
-        source: Full content of the Markdown/text file.
+        source: Full content of the Markdown file.
         max_chunk_size: Maximum number of characters per chunk. Must
             match the value used consistently across indexing and
             retrieval.
