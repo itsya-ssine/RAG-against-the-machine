@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Virtual environment
+.venv/
+
+# Data: keep the folders, ignore their content
+data/raw/*
+data/processed/*
+data/output/search_results/*
+data/output/search_results_and_answer/*
+data/datasets/UnansweredQuestions/*
+data/datasets/AnsweredQuestions/*
+!**/.gitkeep
+
+# Moulinette and model weights
+moulinette*
+*.safetensors
+*.bin
