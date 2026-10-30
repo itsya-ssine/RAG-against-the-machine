@@ -9,6 +9,10 @@ PROCESSED_DIR: Path = Path("data/processed")
 DATASETS_DIR: Path = Path("data/datasets")
 OUTPUT_DIR: Path = Path("data/output")
 
+# Files written by the indexer inside the processed directory.
+INDEX_FILENAME: str = "bm25_index.json"
+CHUNKS_FILENAME: str = "chunks.json"
+
 # Chunking limits. The moulinette rejects any source longer than
 # MAX_ALLOWED_CHUNK_SIZE characters (its max_context_length).
 DEFAULT_MAX_CHUNK_SIZE: int = 2000
