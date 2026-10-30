@@ -17,6 +17,13 @@ _SEPARATORS: Tuple[str, ...] = ("\n\n", "\r\n\r\n", "\n", " ")
 # window in the piece, to avoid producing tiny chunks.
 _MIN_PIECE_RATIO: float = 0.5
 
+# build_chunks merges a piece smaller than this share of the limit into
+# the next one.
+_MERGE_RATIO: float = 0.15
+
+# (start_index, end_index, context_string)
+Piece = Tuple[int, int, str]
+
 
 class Chunk(BaseModel):
     """A contiguous piece of a corpus file.
@@ -111,3 +118,60 @@ def split_by_size(
         pos = cut
 
     return spans
+
+
+def build_chunks(
+    file_path: str,
+    text: str,
+    pieces: List[Piece],
+    max_size: int,
+) -> List[Chunk]:
+    """Turn contiguous pieces of a file into validated chunks.
+
+    A piece smaller than 15% of ``max_size`` is first merged with the
+    piece that follows (when the result fits), because a tiny chunk such
+    as a lone heading or a few imports is scored too high by BM25. The
+    merged piece keeps the context of the later piece. Each piece is then
+    trimmed of surrounding whitespace, and blank pieces are dropped.
+
+    Args:
+        file_path: Corpus path stored in every chunk.
+        text: Full content of the file.
+        pieces: ``(start, end, context)`` spans in file order, each at
+            most ``max_size`` long.
+        max_size: Maximum chunk length in characters.
+
+    Returns:
+        The chunks, in file order.
+    """
+    minimum = max(1, int(max_size * _MERGE_RATIO))
+    merged: List[Piece] = []
+
+    for start, end, context in pieces:
+        if (merged and merged[-1][1] - merged[-1][0] < minimum
+                and end - merged[-1][0] <= max_size):
+            start = merged.pop()[0]
+
+        merged.append((start, end, context))
+
+    chunks: List[Chunk] = []
+    for start, end, context in merged:
+        raw = text[start:end]
+        body = raw.strip()
+
+        if not body:
+            continue
+
+        first = start + len(raw) - len(raw.lstrip())
+
+        chunks.append(
+            Chunk(
+                file_path=file_path,
+                first_character_index=first,
+                last_character_index=first + len(body),
+                text=body,
+                context=context,
+            )
+        )
+
+    return chunks

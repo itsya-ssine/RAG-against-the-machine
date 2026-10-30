@@ -9,22 +9,17 @@ the headings above it as search-only context.
 import re
 from typing import List, Optional, Tuple
 
-from src.chunking.common import Chunk, split_by_size
+from src.chunking.common import Chunk, Piece, build_chunks, split_by_size
 
 # '# --8<-- [start:x]' lines of the *.inc.md files are mkdocs markers,
 # not headings.
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(?![ \t]|--8<--)(\S.*?)[ \t]*#*$")
 _FENCE = re.compile(r"^\s*(```|~~~)")
 
-# A piece smaller than this share of the limit is merged with the next.
-_MIN_PIECE_RATIO = 0.15
-
 # (level, title)
 Heading = Tuple[int, str]
 # (start_index, end_index, heading)
 Block = Tuple[int, int, Optional[Heading]]
-# (start_index, end_index, context_string)
-Piece = Tuple[int, int, str]
 
 
 def _blocks(text: str) -> List[Block]:
@@ -128,33 +123,6 @@ def _pieces(text: str, max_size: int) -> List[Piece]:
     return pieces
 
 
-def _merge_small(pieces: List[Piece], max_size: int) -> List[Piece]:
-    """Merge each undersized piece with the one that follows it.
-
-    A lone heading would otherwise become a tiny chunk that BM25 scores
-    too high. The merged piece keeps the context of the later piece,
-    whose heading path already contains the parent heading.
-
-    Args:
-        pieces: Contiguous pieces in document order.
-        max_size: Maximum merged length.
-
-    Returns:
-        The merged pieces.
-    """
-    minimum = max(1, int(max_size * _MIN_PIECE_RATIO))
-    merged: List[Piece] = []
-
-    for start, end, context in pieces:
-        if (merged and merged[-1][1] - merged[-1][0] < minimum
-                and end - merged[-1][0] <= max_size):
-            start = merged.pop()[0]
-
-        merged.append((start, end, context))
-
-    return merged
-
-
 def chunk_markdown(
     file_path: str,
     text: str,
@@ -179,26 +147,6 @@ def chunk_markdown(
     if max_chunk_size < 1:
         raise ValueError("max_chunk_size must be at least 1")
 
-    chunks: List[Chunk] = []
-    for start, end, context in _merge_small(
-            _pieces(text, max_chunk_size), max_chunk_size):
-        raw = text[start:end]
-        body = raw.strip()
+    pieces = _pieces(text, max_chunk_size)
 
-        if not body:
-            continue
-
-        first = start + len(raw) - len(raw.lstrip())
-        last = first + len(body)
-
-        chunks.append(
-            Chunk(
-                file_path=file_path,
-                first_character_index=first,
-                last_character_index=last,
-                text=body,
-                context=context,
-            )
-        )
-
-    return chunks
+    return build_chunks(file_path, text, pieces, max_chunk_size)
